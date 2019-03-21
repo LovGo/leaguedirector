@@ -2,6 +2,7 @@ import os
 import time
 import json
 import copy
+import logging
 import functools
 from leaguedirector.widgets import userpath
 from PySide2.QtCore import *
@@ -38,7 +39,8 @@ class Resource(QObject):
             object.__setattr__(self, name, value)
 
     def sslErrors(self, response, errors):
-        response.ignoreSslErrors([e for e in errors if e.error() == QSslError.HostNameMismatch])
+        allowed = [QSslError.CertificateUntrusted, QSslError.HostNameMismatch]
+        response.ignoreSslErrors([e for e in errors if e.error() in allowed])
 
     def manager(self):
         if Resource.network is None:
@@ -84,7 +86,7 @@ class Resource(QObject):
         elif error in (QNetworkReply.ConnectionRefusedError, QNetworkReply.TimeoutError):
             Resource.connected = False
         else:
-            print(self.url, response.errorString())
+            logging.error("Request Failed: {} {}".format(self.url, response.errorString()))
         self.updated.emit()
 
     def apply(self, data):
@@ -225,6 +227,28 @@ class Render(Resource):
         self.cameraRotation = copy
 
 
+class Particles(Resource):
+    url = '/replay/particles'
+    fields = {}
+    particles = {}
+
+    def apply(self, data):
+        self.particles = data
+
+    def items(self):
+        return self.particles.items()
+
+    def hasParticle(self, particle):
+        return particle in self.particles
+
+    def setParticle(self, particle, enabled):
+        if particle in self.particles:
+            self.update({particle:enabled})
+
+    def getParticle(self, particle):
+        return self.particles.get(particle, True)
+
+
 class Playback(Resource):
     url = '/replay/playback'
     fields = {
@@ -350,6 +374,7 @@ class Sequence(Resource):
         self.playback = playback
         self.name = ''
         self.names = []
+        self.directory = None
         self.sequencing = False
         self.saveRemoteTimer = QTimer()
         self.saveRemoteTimer.timeout.connect(self.saveRemoteNow)
@@ -544,7 +569,7 @@ class Sequence(Resource):
         if name == 'skyboxOffset':
             return 'Skybox Offset'
         if name == 'sunDirection':
-            return 'Sun Direciton'
+            return 'Sun Direction'
         if name == 'depthFogEnabled':
             return 'Depth Fog Enable'
         if name == 'depthFogStart':

@@ -1,7 +1,8 @@
 [Setup]
 AppName=League Director
-AppVersion=0.1
+AppVersion=0.1.1
 AppVerName=League Director
+DisableDirPage=no
 DefaultDirName={pf}\League Director
 DefaultGroupName=League Director
 UninstallDisplayIcon={app}\LeagueDirector.exe
@@ -14,7 +15,6 @@ LicenseFile=..\LICENSE
 
 [Files]
 Source: "out\dist\LeagueDirector\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
-Source: "..\resources\*"; DestDir: "{app}\resources\"; Flags: ignoreversion recursesubdirs
 
 [Icons]
 Name: "{group}\League Director"; Filename: "{app}\LeagueDirector.exe"

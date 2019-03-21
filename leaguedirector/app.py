@@ -1,14 +1,20 @@
 import os
 import sys
+import json
 import functools
+import logging
+import logging.handlers
+import leaguedirector
 from PySide2.QtGui import *
 from PySide2.QtCore import *
 from PySide2.QtWidgets import *
+from PySide2.QtNetwork import *
 from leaguedirector.widgets import *
 from leaguedirector.sequencer import *
 from leaguedirector.enable import *
-from leaguedirector.api import Game, Playback, Render, Recording, Sequence
+from leaguedirector.api import Game, Playback, Render, Particles, Recording, Sequence
 from leaguedirector.bindings import Bindings
+from leaguedirector.settings import Settings
 
 
 class SkyboxCombo(QComboBox):
@@ -97,7 +103,8 @@ class VisibleWindow(QScrollArea):
     def __init__(self, api):
         QScrollArea.__init__(self)
         self.api = api
-        self.api.updated.connect(self.update)
+        self.api.render.updated.connect(self.update)
+        self.api.connected.connect(self.connect)
         self.inputs = {}
         self.bindings = {}
         self.setWidgetResizable(True)
@@ -114,9 +121,13 @@ class VisibleWindow(QScrollArea):
         widget.setLayout(layout)
         self.setWidget(widget)
 
-    def update(self):
+    def connect(self):
         for name, field in self.inputs.items():
             self.api.render.set(name, field.value())
+
+    def update(self):
+        for name, field in self.inputs.items():
+            field.setValue(self.api.render.get(name))
 
     def restoreSettings(self, data):
         for name, value in data.items():
@@ -136,7 +147,7 @@ class RenderWindow(QScrollArea):
     def __init__(self, api):
         QScrollArea.__init__(self)
         self.api = api
-        self.api.updated.connect(self.update)
+        self.api.render.updated.connect(self.update)
         self.cameraMode = QLabel('')
         self.cameraLockX = BooleanInput('X')
         self.cameraLockY = BooleanInput('Y')
@@ -312,11 +323,55 @@ class RenderWindow(QScrollArea):
         self.depthOfFieldFar.update(self.api.render.depthOfFieldFar)
 
 
+class ParticlesWindow(VBoxWidget):
+    def __init__(self, api):
+        VBoxWidget.__init__(self)
+        self.api = api
+        self.api.particles.updated.connect(self.update)
+        self.items = {}
+        self.search = QLineEdit()
+        self.search.setPlaceholderText('Search...')
+        self.search.textEdited.connect(self.textEdited)
+        self.list = QListWidget()
+        self.list.setSortingEnabled(True)
+        self.list.itemChanged.connect(self.itemChanged)
+        self.addWidget(self.search)
+        self.addWidget(self.list)
+        self.setWindowTitle('Particles')
+
+    def textEdited(self, text):
+        search = text.lower()
+        for particle, item in self.items.items():
+            if len(search) == 0 or search in particle.lower():
+                item.setHidden(False)
+            else:
+                item.setHidden(True)
+
+    def itemChanged(self, item):
+        particle = item.text()
+        enabled = item.checkState() == Qt.Checked
+        if enabled != self.api.particles.getParticle(particle):
+            self.api.particles.setParticle(particle, enabled)
+
+    def update(self):
+        for particle, enabled in self.api.particles.items():
+            if particle not in self.items:
+                item = QListWidgetItem(particle)
+                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                item.setBackground(QApplication.palette().toolTipBase())
+                self.list.addItem(item)
+                self.items[particle] = item
+            self.items[particle].setCheckState(Qt.Checked if enabled else Qt.Unchecked)
+        for particle in self.items.keys():
+            if not self.api.particles.hasParticle(particle):
+                self.list.removeItemWidget(self.items.pop(particle))
+
+
 class RecordingWindow(VBoxWidget):
     def __init__(self, api):
         VBoxWidget.__init__(self)
         self.api = api
-        self.api.updated.connect(self.update)
+        self.api.recording.updated.connect(self.update)
         self.recordings = set()
 
         self.codec = QComboBox()
@@ -431,7 +486,8 @@ class TimelineWindow(QWidget):
     def __init__(self, api):
         QWidget.__init__(self)
         self.api = api
-        self.api.updated.connect(self.update)
+        self.api.playback.updated.connect(self.update)
+        self.api.sequence.updated.connect(self.update)
         self.timer = schedule(10, self.animate)
         self.sequenceHeaders = SequenceHeaderView(self.api)
         self.sequenceTracks = SequenceTrackView(self.api, self.sequenceHeaders)
@@ -652,23 +708,32 @@ class TimelineWindow(QWidget):
 
 
 class Api(QObject):
-    updated = Signal()
+    connected = Signal()
 
     def __init__(self):
         QObject.__init__(self)
+        self.wasConnected = False
         self.game = Game()
         self.render = Render()
+        self.particles = Particles()
         self.playback = Playback()
         self.recording = Recording()
         self.sequence = Sequence(self.render, self.playback)
-        self.game.updated.connect(self.updated.emit)
-        self.render.updated.connect(self.updated.emit)
-        self.playback.updated.connect(self.updated.emit)
-        self.recording.updated.connect(self.updated.emit)
+        self.game.updated.connect(self.updated)
+        self.render.updated.connect(self.updated)
+        self.particles.updated.connect(self.updated)
+        self.playback.updated.connect(self.updated)
+        self.recording.updated.connect(self.updated)
+
+    def updated(self):
+        if not self.wasConnected and self.game.connected:
+            self.connected.emit()
+        self.wasConnected = self.game.connected
 
     def update(self):
         self.game.update()
         self.render.update()
+        self.particles.update()
         self.playback.update()
         self.recording.update()
 
@@ -709,6 +774,18 @@ class Api(QObject):
             self.render.fieldOfView = self.render.fieldOfView * 1.05
         elif name == 'camera_fov_down':
             self.render.fieldOfView = self.render.fieldOfView * 0.95
+        elif name == 'render_dof_near_up':
+            self.render.depthOfFieldNear = self.render.depthOfFieldNear * 1.05
+        elif name == 'render_dof_near_down':
+            self.render.depthOfFieldNear = self.render.depthOfFieldNear * 0.95
+        elif name == 'render_dof_mid_up':
+            self.render.depthOfFieldMid = self.render.depthOfFieldMid * 1.05
+        elif name == 'render_dof_mid_down':
+            self.render.depthOfFieldMid = self.render.depthOfFieldMid * 0.95
+        elif name == 'render_dof_far_up':
+            self.render.depthOfFieldFar = self.render.depthOfFieldFar * 1.05
+        elif name == 'render_dof_far_down':
+            self.render.depthOfFieldFar = self.render.depthOfFieldFar * 0.95
         elif name == 'play_pause':
             self.playback.paused = not self.playback.paused
         elif name == 'time_minus_120':
@@ -744,8 +821,8 @@ class ConnectWindow(QDialog):
         self.welcome.setText("""
             <h3>Welcome to League Director!</h3>
             <p><a href="https://github.com/riotgames/leaguedirector/">https://github.com/riotgames/leaguedirector/</a></p>
-            <p>Please make sure your League of Legends install is enabled by ticking the boxes below.</p>
-            <p>Once enabled, start up a replay in the League of Legends client to begin.<br/></p>
+            <p>First ensure your game has enabled the <a href="https://developer.riotgames.com/replay-apis.html">Replay API</a> by checking the box next to your installation.</p>
+            <p>Once enabled, start up a replay in the League of Legends client and League Director will automatically connect.<br/></p>
         """)
         self.welcome.setTextInteractionFlags(Qt.TextBrowserInteraction)
         self.welcome.setTextFormat(Qt.RichText)
@@ -783,8 +860,28 @@ class ConnectWindow(QDialog):
             self.list.addItem(item)
 
 
+class UpdateWindow(QDialog):
+    def __init__(self):
+        QDialog.__init__(self)
+        self.setWindowTitle('Update Available!')
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+        self.setWindowModality(Qt.WindowModal)
+        self.welcome = QLabel()
+        self.welcome.setText("""
+            <h3>A new version of League Director is available!</h3>
+            <p><a href="https://github.com/riotgames/leaguedirector/releases/latest">https://github.com/riotgames/leaguedirector/releases/latest</a></p>
+            <p>Download the latest version by clicking the link above.</p>
+        """)
+        self.welcome.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.welcome.setTextFormat(Qt.RichText)
+        self.welcome.setOpenExternalLinks(True)
+        self.layout.addWidget(self.welcome)
+
+
 class LeagueDirector(object):
     def __init__(self):
+        self.setupLogging()
         self.app = QApplication()
         self.setup()
         sys.exit(self.app.exec_())
@@ -795,20 +892,23 @@ class LeagueDirector(object):
         self.mdi = QMdiArea()
         self.api = Api()
         self.windows = {}
-        self.settings = QSettings("RiotGames", "LeagueDirector")
+        self.settings = Settings()
         self.bindings = self.setupBindings()
         self.addWindow(RenderWindow(self.api), 'render')
+        self.addWindow(ParticlesWindow(self.api), 'particles')
         self.addWindow(VisibleWindow(self.api), 'visible')
         self.addWindow(TimelineWindow(self.api), 'timeline')
         self.addWindow(RecordingWindow(self.api), 'recording')
         self.addWindow(KeybindingsWindow(self.bindings), 'bindings')
         self.addWindow(ConnectWindow(), 'connect')
+        self.addWindow(UpdateWindow(), 'update')
         self.window.setCentralWidget(self.mdi)
         self.window.setWindowTitle('League Director')
         self.window.setWindowIcon(QIcon(respath('icon.ico')))
         self.window.closeEvent = self.closeEvent
         self.window.show()
         self.restoreSettings()
+        self.checkUpdate()
         self.bindings.triggered.connect(self.api.onKeybinding)
         self.bindings.triggered.connect(self.windows['timeline'].onKeybinding)
         self.bindings.triggered.connect(self.windows['visible'].onKeybinding)
@@ -819,6 +919,48 @@ class LeagueDirector(object):
     def closeEvent(self, event):
         self.saveSettings()
         QMainWindow.closeEvent(self.window, event)
+
+    def setupLogging(self):
+        logger = logging.getLogger()
+        formatter = logging.Formatter('%(asctime)s [%(levelname)-8s] %(message)s')
+        path = userpath('logs', 'leaguedirector.log')
+        handler = logging.handlers.RotatingFileHandler(path, backupCount=20)
+        try:
+            handler.doRollover()
+        except Exception: pass
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logging.info('Started League Director (%s)', leaguedirector.__version__)
+        qInstallMessageHandler(self.handleMessage)
+
+    def checkUpdate(self):
+        self.updateAvailable = False
+        request = QNetworkRequest(QUrl('https://api.github.com/repos/riotgames/leaguedirector/releases/latest'))
+        response = self.api.game.manager().get(request)
+        def callback():
+            if response.error() == QNetworkReply.NoError:
+                version = json.loads(response.readAll().data().decode()).get('tag_name')
+                if version and version != 'v{}'.format(leaguedirector.__version__):
+                    self.updateAvailable = True
+        response.finished.connect(callback)
+
+    def handleMessage(self, msgType, msgContext, msgString):
+        if msgType == QtInfoMsg:
+            logging.info('(QT) %s', msgString)
+        elif msgType == QtDebugMsg:
+            logging.debug('(QT) %s', msgString)
+        elif msgType == QtWarningMsg:
+            logging.warning('(QT) %s', msgString)
+        elif msgType == QtCriticalMsg:
+            logging.critical('(QT) %s', msgString)
+        elif msgType == QtFatalMsg:
+            logging.critical('(QT) %s', msgString)
+        elif msgType == QtSystemMsg:
+            logging.critical('(QT) %s', msgString)
 
     def setupBindings(self):
         return Bindings(self.window, self.settings.value('bindings', {}), [
@@ -841,6 +983,12 @@ class LeagueDirector(object):
             ('camera_attach',               'Camera Attach',                    ''),
             ('camera_fov_up',               'Camera Increase Field of View',    ''),
             ('camera_fov_down',             'Camera Decrease Field of View',    ''),
+            ('render_dof_near_up',          'Increase Depth of Field Near',     ''),
+            ('render_dof_near_down',        'Decrease Depth of Field Near',     ''),
+            ('render_dof_mid_up',           'Increase Depth of Field Mid',      ''),
+            ('render_dof_mid_down',         'Decrease Depth of Field Mid',      ''),
+            ('render_dof_far_up',           'Increase Depth of Field Far',      ''),
+            ('render_dof_far_down',         'Decrease Depth of Field Far',      ''),
             ('show_fog_of_war',             'Show Fog of War',                  ''),
             ('show_selected_outline',       'Show Selected Outline',            ''),
             ('show_hover_outline',          'Show Hover Outline',               ''),
@@ -926,27 +1074,39 @@ class LeagueDirector(object):
         self.api.update()
         self.bindings.setGamePid(self.api.game.processID)
         for name, window in self.windows.items():
-            if name == 'connect':
+            if name == 'update':
+                window.parent().setVisible(self.updateAvailable)
+            elif name == 'connect':
                 window.parent().setVisible(not self.api.game.connected)
             else:
                 window.parent().setVisible(self.api.game.connected)
 
+    def loadGeometry(self, widget, data):
+        if data and len(data) == 4:
+            widget.setGeometry(*data)
+
+    def loadState(self, widget, data):
+        if data is not None:
+            widget.setWindowState(Qt.WindowStates(data))
+
     def restoreSettings(self):
-        self.window.restoreState(self.settings.value('window/state'))
-        self.window.restoreGeometry(self.settings.value('window/geo'))
+        self.loadState(self.window, self.settings.value('window/state'))
+        self.loadGeometry(self.window, self.settings.value('window/geo'))
         for name, widget in self.windows.items():
-            widget.parentWidget().setWindowState(self.settings.value('{}/state'.format(name), widget.parentWidget().windowState()))
-            widget.parentWidget().setGeometry(self.settings.value('{}/geo'.format(name), widget.parentWidget().geometry()))
+            parent = widget.parentWidget()
+            self.loadState(parent, self.settings.value('{}/state'.format(name)))
+            self.loadGeometry(parent, self.settings.value('{}/geo'.format(name)))
             if hasattr(widget, 'restoreSettings'):
                 widget.restoreSettings(self.settings.value('{}/settings'.format(name), {}) or {})
 
     def saveSettings(self):
         self.settings.setValue('bindings', self.bindings.getBindings())
-        self.settings.setValue('window/state', self.window.saveState())
-        self.settings.setValue('window/geo', self.window.saveGeometry())
+        self.settings.setValue('window/state', int(self.window.windowState()))
+        self.settings.setValue('window/geo', self.window.geometry().getRect())
         for name, widget in self.windows.items():
-            self.settings.setValue('{}/state'.format(name), int(widget.parentWidget().windowState()))
-            self.settings.setValue('{}/geo'.format(name), widget.parentWidget().geometry())
+            parent = widget.parentWidget()
+            self.settings.setValue('{}/state'.format(name), int(parent.windowState()))
+            self.settings.setValue('{}/geo'.format(name), parent.geometry().getRect())
             if hasattr(widget, 'saveSettings'):
                 self.settings.setValue('{}/settings'.format(name), widget.saveSettings())
 
@@ -984,4 +1144,7 @@ class LeagueDirector(object):
 
 
 if __name__ == '__main__':
-    LeagueDirector()
+    try:
+        LeagueDirector()
+    except Exception as exception:
+        logging.exception(exception)
